@@ -1,6 +1,8 @@
-# meta developer: @phazmalist
+# meta developer: @phazmalist, @phazmalistPlugins
 # meta name: RPmodule
-
+# meta banner: https://raw.githubusercontent.com/SkyComic-hash/Banner/main/RPmodule.jpg
+# scope: hikka_only
+# meta version: 1.0.0
 import html
 from .. import loader, utils
 
@@ -45,13 +47,12 @@ class RPmodule(loader.Module):
 
         emoji_html = f'<tg-emoji emoji-id="{emoji_id}">🎭</tg-emoji>'
 
-        # Собираем схему: Эмодзи | Автор action [доп_текст] Цель
+        
         if addon:
             text = f'{emoji_html} | {me} {action} {html.escape(addon)} {target}'
         else:
             text = f'{emoji_html} | {me} {action} {target}'
 
-        # Если есть перенос строки — добавляем реплику снизу
         if replica:
             text += f'\n💬 С репликой: «{html.escape(replica)}»'
 
@@ -211,7 +212,7 @@ class RPmodule(loader.Module):
 
     async def цьомcmd(self, message):
         """Цьомнул"""
-        await self._send_rp(message, "55215305764498858909", "цьомнул")
+        await self._send_rp(message, "5454028838608605673", "цьомнул")
 
     async def поставитьcmd(self, message):
         """Поставил"""

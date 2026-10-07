@@ -1,0 +1,804 @@
+# meta developer: @phazmalist, @phazmalistPlugins
+# meta name: RichInfo
+# meta version: 1.2.0
+# requires: psutil aiohttp
+
+__version__ = (1, 2, 0)
+
+import asyncio
+import logging
+import os
+import platform
+import random
+import re
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import aiohttp
+import psutil
+
+from .. import loader, utils, validators
+
+logger = logging.getLogger(__name__)
+
+INLINE_KEY = "richinfo"
+
+DEFAULT_FIELDS = "version,uptime,ram,cpu,python,system,modules"
+
+ROW_LABELS = {
+    "version": "Версия",
+    "uptime": "Аптайм",
+    "ram": "RAM",
+    "cpu": "CPU",
+    "python": "Python",
+    "system": "Система",
+    "modules": "Модулей",
+}
+
+
+def _kyiv_now() -> datetime:
+    for name in ("Europe/Kyiv", "Europe/Kiev"):
+        try:
+            return datetime.now(ZoneInfo(name))
+        except Exception:
+            continue
+    return datetime.now(timezone(timedelta(hours=2)))
+
+
+def _render(template: str, values: dict) -> str:
+    """Подставляет только известные плейсхолдеры."""
+    return re.sub(
+        r"\{(\w+)\}",
+        lambda m: str(values[m.group(1)])
+        if m.group(1) in values
+        else m.group(0),
+        template,
+    )
+
+
+@loader.tds
+class RichInfo(loader.Module):
+    """!rinfo и !rping в Rich-режиме Telegram"""
+
+    strings = {
+        "name": "RichInfo",
+        "ping_wait": "🏓",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "rich",
+                True,
+                "Отправлять ответы как Rich Message (False — обычный HTML)",
+                validator=validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "custom_message",
+                "",
+                "Кастомный текст !rinfo. "
+                "Плейсхолдеры: "
+                "{me} {version} {build} {prefix} {platform} {upd} "
+                "{uptime} {cpu_usage} {ram_usage} {branch} {hostname} "
+                "{user} {os} {kernel} {cpu} {ping} {python_ver} {htl_ver} "
+                "{git_status} {time} {date} {day_of_the_week} "
+                "{data_and_time} {data_and_time_and_day_of_the_week} "
+                "{weather} {outdoor_temperature} {weather_and_temperature} "
+                "{humidity} {pressure} {wind_speed}",
+                validator=validators.String(),
+            ),
+            loader.ConfigValue(
+                "custom_ping",
+                "",
+                "Свой шаблон !rping. "
+                "Плейсхолдеры: {ping_emoji} {ms} {uptime} {time}",
+                validator=validators.String(),
+            ),
+            loader.ConfigValue(
+                "ping_emoji",
+                "🏓",
+                "Эмодзи для !rping",
+                validator=validators.String(),
+            ),
+            loader.ConfigValue(
+                "banner_url",
+                "",
+                "Ссылка на media/banner. Можно несколько через запятую.",
+                validator=validators.String(),
+            ),
+            loader.ConfigValue(
+                "quote_media",
+                False,
+                "Оформлять media как цитату.",
+                validator=validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "inverse_media",
+                False,
+                "Расположение media: False — над текстом, True — под текстом.",
+                validator=validators.Boolean(),
+            ),
+        )
+
+        self._pending = {}
+        self._last_error = ""
+
+    async def client_ready(self, client, db):
+        self._client = client
+        self._db = db
+        self.session = aiohttp.ClientSession()
+        self._me = await client.get_me()
+        self._proc = psutil.Process(os.getpid())
+        self._proc.cpu_percent(None)
+
+    async def on_unload(self):
+        await self.session.close()
+
+    # ---------- данные ----------
+
+    def _owner(self) -> str:
+        me = self._me
+        parts = [
+            getattr(me, "first_name", None),
+            getattr(me, "last_name", None),
+        ]
+        return " ".join(p for p in parts if p) or str(
+            getattr(me, "id", "?")
+        )
+
+    def _uptime(self) -> str:
+        seconds = int(time.time() - self._proc.create_time())
+        days, rest = divmod(seconds, 86400)
+        hours, rest = divmod(rest, 3600)
+        mins, secs = divmod(rest, 60)
+
+        return (
+            (f"{days} д " if days else "")
+            + f"{hours:02d}:{mins:02d}:{secs:02d}"
+        )
+
+    def _version(self) -> str:
+        try:
+            from .. import version
+
+            raw = getattr(version, "__version__", None)
+            ver = (
+                ".".join(map(str, raw))
+                if isinstance(raw, (tuple, list))
+                else str(raw or "?")
+            )
+        except Exception:
+            ver = "?"
+
+        try:
+            git = str(utils.get_git_hash() or "")[:7]
+        except Exception:
+            git = ""
+
+        return f"`{ver}`" + (f" `#{git}`" if git else "")
+
+    async def _stats(self) -> dict:
+        await asyncio.sleep(0.3)
+
+        rss = self._proc.memory_info().rss / 1024 / 1024
+
+        try:
+            modules = str(len(self.allmodules.modules))
+        except Exception:
+            modules = None
+
+        return {
+            "version": self._version(),
+            "uptime": self._uptime(),
+            "ram": f"{rss:.1f} MB",
+            "cpu": f"{self._proc.cpu_percent(None):.1f}%",
+            "python": platform.python_version(),
+            "system": f"{platform.system()} {platform.release()}",
+            "modules": modules,
+        }
+
+    def _rows(self, stats: dict) -> list:
+        wanted = [
+            f.strip().lower()
+            for f in DEFAULT_FIELDS.split(",")
+        ]
+
+        return [
+            (ROW_LABELS[f], stats[f])
+            for f in wanted
+            if f in ROW_LABELS and stats.get(f) is not None
+        ]
+
+    async def _weather(self) -> dict:
+        result = {
+            "weather": "?",
+            "outdoor_temperature": "?",
+            "weather_and_temperature": "?",
+            "humidity": "?",
+            "pressure": "?",
+            "wind_speed": "?",
+        }
+
+        try:
+            async with self.session.get(
+                "https://wttr.in/Kyiv?format=j1",
+                timeout=aiohttp.ClientTimeout(total=8),
+                headers={
+                    "User-Agent": "RichInfo/1.2"
+                },
+            ) as resp:
+                if resp.status != 200:
+                    return result
+
+                data = await resp.json(
+                    content_type=None
+                )
+
+            current = (
+                data.get("current_condition") or [{}]
+            )[0]
+
+            desc = (
+                current.get("weatherDesc") or [{}]
+            )[0].get("value") or "?"
+
+            temp = current.get(
+                "temp_C",
+                "?"
+            )
+
+            humidity = current.get(
+                "humidity",
+                "?"
+            )
+
+            pressure = current.get(
+                "pressure",
+                "?"
+            )
+
+            wind = current.get(
+                "windspeedKmph",
+                "?"
+            )
+
+            result.update(
+                {
+                    "weather": str(desc),
+                    "outdoor_temperature": f"{temp} °C",
+                    "weather_and_temperature": (
+                        f"{desc}, {temp} °C"
+                    ),
+                    "humidity": f"{humidity}%",
+                    "pressure": f"{pressure} hPa",
+                    "wind_speed": f"{wind} km/h",
+                }
+            )
+
+        except Exception as e:
+            logger.debug(
+                "RichInfo weather failed: %s",
+                e,
+            )
+
+        return result
+
+    async def _info_values(
+        self,
+        stats: dict,
+        now: datetime,
+    ) -> dict:
+
+        try:
+            branch = str(
+                utils.get_git_branch() or "?"
+            )
+        except Exception:
+            branch = "?"
+
+        try:
+            git_hash = str(
+                utils.get_git_hash() or ""
+            )
+
+            git_status = (
+                git_hash[:7]
+                if git_hash
+                else "?"
+            )
+
+        except Exception:
+            git_status = "?"
+
+        try:
+            prefix = str(
+                self.get_prefix() or "."
+            )
+        except Exception:
+            prefix = "."
+
+        try:
+            from .. import version
+
+            raw_version = getattr(
+                version,
+                "__version__",
+                None,
+            )
+
+            if isinstance(
+                raw_version,
+                (tuple, list),
+            ):
+                version_plain = ".".join(
+                    map(str, raw_version)
+                )
+            else:
+                version_plain = str(
+                    raw_version or "?"
+                )
+
+            raw_build = getattr(
+                version,
+                "__build__",
+                None,
+            )
+
+            build = (
+                str(raw_build)
+                if raw_build is not None
+                else "?"
+            )
+
+        except Exception:
+            version_plain = "?"
+            build = "?"
+
+        try:
+            username = getattr(
+                self._me,
+                "username",
+                None,
+            )
+
+            me = (
+                f"@{username}"
+                if username
+                else self._owner()
+            )
+        except Exception:
+            me = self._owner()
+
+        day_names = [
+            "Понедельник",
+            "Вторник",
+            "Среда",
+            "Четверг",
+            "Пятница",
+            "Суббота",
+            "Воскресенье",
+        ]
+
+        day = day_names[now.weekday()]
+
+        values = {
+            # Основные
+            "me": me,
+            "version": version_plain,
+            "build": build,
+            "prefix": prefix,
+            "platform": platform.platform(),
+            "upd": "?",
+            "uptime": stats.get(
+                "uptime",
+                "?",
+            ),
+            "cpu_usage": stats.get(
+                "cpu",
+                "?",
+            ),
+            "ram_usage": stats.get(
+                "ram",
+                "?",
+            ),
+            "branch": branch,
+            "hostname": platform.node() or "?",
+            "user": self._owner(),
+            "os": platform.system(),
+            "kernel": platform.release(),
+            "cpu": (
+                platform.processor()
+                or platform.machine()
+                or "?"
+            ),
+            "ping": "?",
+            "python_ver": platform.python_version(),
+            "htl_ver": version_plain,
+            "git_status": git_status,
+
+            # Дата и время
+            "time": f"{now:%H:%M:%S}",
+            "date": f"{now:%d.%m.%Y}",
+            "day_of_the_week": day,
+            "data_and_time": (
+                f"{now:%d.%m.%Y %H:%M:%S}"
+            ),
+            "data_and_time_and_day_of_the_week": (
+                f"{now:%d.%m.%Y %H:%M:%S}, {day}"
+            ),
+
+            # Совместимость со старыми шаблонами
+            "title": "Elys",
+            "ram": stats.get("ram", "?"),
+            "python": stats.get("python", "?"),
+            "system": stats.get("system", "?"),
+            "modules": stats.get("modules", "?"),
+        }
+
+        values.update(
+            await self._weather()
+        )
+
+        return values
+
+    def _banner_markdown(self) -> str:
+        urls = [
+            u.strip()
+            for u in (
+                self.config["banner_url"]
+                or ""
+            ).split(",")
+            if u.strip()
+        ]
+
+        if not urls:
+            return ""
+
+        return (
+            f"![]({random.choice(urls)})\n\n"
+        )
+
+    # ---------- рич-доставка ----------
+
+    async def _rich_api(
+        self,
+        method: str,
+        payload: dict,
+    ):
+        inline = getattr(
+            self,
+            "inline",
+            None,
+        )
+
+        token = (
+            getattr(
+                getattr(
+                    inline,
+                    "bot",
+                    None,
+                ),
+                "token",
+                None,
+            )
+            or getattr(
+                inline,
+                "_token",
+                None,
+            )
+        )
+
+        if not token:
+            for ns in (
+                "elys.inline",
+                "heroku.inline",
+                "hikka.inline",
+            ):
+                try:
+                    token = self._db.get(
+                        ns,
+                        "bot_token",
+                        None,
+                    )
+                except Exception:
+                    token = None
+
+                if token:
+                    break
+
+        if not token:
+            raise RuntimeError(
+                "инлайн-бот недоступен"
+            )
+
+        async with self.session.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(
+                total=30
+            ),
+        ) as resp:
+
+            data = await resp.json(
+                content_type=None
+            )
+
+        if not data.get("ok"):
+            raise RuntimeError(
+                data.get(
+                    "description",
+                    "ошибка Bot API",
+                )
+            )
+
+        return data.get("result")
+
+    @loader.inline_handler()
+    async def richinfo_inline_handler(
+        self,
+        query,
+    ):
+        words = str(
+            getattr(
+                query,
+                "query",
+                "",
+            )
+            or ""
+        ).split()
+
+        token = (
+            words[-1]
+            if words
+            else ""
+        )
+
+        markdown = self._pending.get(
+            token
+        )
+
+        if not markdown:
+            return
+
+        qid = getattr(
+            query,
+            "id",
+            None,
+        ) or getattr(
+            getattr(
+                query,
+                "inline_query",
+                None,
+            ),
+            "id",
+            None,
+        )
+
+        await self._rich_api(
+            "answerInlineQuery",
+            {
+                "inline_query_id": qid,
+                "results": [
+                    {
+                        "type": "article",
+                        "id": token,
+                        "title": "RichInfo",
+                        "input_message_content": {
+                            "rich_message": {
+                                "markdown": markdown
+                            }
+                        },
+                    }
+                ],
+                "cache_time": 0,
+                "is_personal": True,
+            },
+        )
+
+    async def _send_rich(
+        self,
+        message,
+        candidates: list,
+    ) -> bool:
+
+        if not self.config["rich"]:
+            return False
+
+        for markdown in candidates:
+            token = uuid.uuid4().hex[:12]
+            self._pending[token] = markdown
+
+            try:
+                if not getattr(
+                    self.inline,
+                    "init_complete",
+                    True,
+                ):
+                    raise RuntimeError(
+                        "инлайн-бот ещё не готов"
+                    )
+
+                username = (
+                    getattr(
+                        self.inline,
+                        "bot_username",
+                        None,
+                    )
+                    or (
+                        await self.inline.bot.get_me()
+                    ).username
+                )
+
+                results = await self._client.inline_query(
+                    username,
+                    f"{INLINE_KEY} {token}",
+                )
+
+                if not results:
+                    raise RuntimeError(
+                        "пустой ответ на inline-запрос"
+                    )
+
+                await results[0].click(
+                    message.chat_id,
+                    reply_to=getattr(
+                        message,
+                        "reply_to_msg_id",
+                        None,
+                    ),
+                )
+
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+
+                return True
+
+            except Exception as e:
+                self._last_error = (
+                    f"{type(e).__name__}: {e}"
+                )
+
+                logger.warning(
+                    "RichInfo: rich attempt failed: %s",
+                    self._last_error,
+                )
+
+            finally:
+                self._pending.pop(
+                    token,
+                    None,
+                )
+
+        return False
+
+    # ---------- команды ----------
+
+    async def _info(self, message):
+        stats = await self._stats()
+        rows = self._rows(stats)
+
+        now_dt = _kyiv_now()
+
+        template = (
+            self.config["custom_message"]
+            or ""
+        ).strip()
+
+        values = await self._info_values(
+            stats,
+            now_dt,
+        )
+
+        if template:
+            body = _render(
+                template,
+                values,
+            )
+        else:
+            table = "\n".join(
+                f"| {k} | {v} |"
+                for k, v in rows
+            )
+
+            body = (
+                "## 🌌 Elys\n\n"
+                f"> **{self._owner()}**\n\n"
+                "| Параметр | Значение |\n"
+                "|---|---|\n"
+                f"{table}\n\n"
+                "---\n\n"
+                f"<footer>{now_dt:%d.%m.%Y %H:%M:%S}</footer>"
+            )
+
+        media = self._banner_markdown()
+
+        if media:
+            if self.config["quote_media"]:
+                media = "\n".join(
+                    "> " + line
+                    for line in media.rstrip().splitlines()
+                ) + "\n\n"
+
+            if self.config["inverse_media"]:
+                candidates = [
+                    body.rstrip()
+                    + "\n\n"
+                    + media.lstrip(),
+                    body,
+                ]
+            else:
+                candidates = [
+                    media
+                    + body,
+                    body,
+                ]
+        else:
+            candidates = [body]
+
+        if await self._send_rich(
+            message,
+            candidates,
+        ):
+            return
+
+        plain = "\n".join(
+            f"<b>{k}:</b> "
+            f"{v.replace('`', '')}"
+            for k, v in rows
+        )
+
+        await utils.answer(
+            message,
+            "🌌 <b>Elys</b>\n"
+            f"<blockquote>{plain}</blockquote>",
+        )
+
+    async def _ping(self, message):
+        reply_to = getattr(
+            message,
+            "reply_to_msg_id",
+            None,
+        )
+
+        emoji = (
+            self.config["ping_emoji"]
+            or "🏓"
+        )
+
+        start = time.perf_counter()
+
+        message = await utils.answer(
+            message,
+            emoji,
+        )
+
+        ms = (
+            time.perf_counter() - start
+        ) * 1000
+
+        values = {
+            "ping_emoji": emoji,
+            "ms": f"{ms:.0f}",
+            "uptime": self._uptime(),
+            "time": (
+                f"{_kyiv_now():%d.%m.%Y %H:%M:%S}"
+            ),
+        }
+
+        template = (
+            self.config["custom_ping"]
+            or ""
+        ).strip() or (
+            "## {ping_emoji} Pong\n\n"
+            "**Задержка:** `{ms} ms`\n\n"
+            "**Аптайм:** {uptime}"
+        )
+
+        try:
+            message.reply_to_msg_id = reply_to
+        except Exception:
+      
